@@ -1,0 +1,532 @@
+"""
+MIMO-OFDM Channel Estimation Simulation
+Produces clean, paper-quality NMSE and BER plots.
+Methods: LS, LS-DFT, LMMSE, CNN (numpy only)
+Run: python3 mimo_ofdm_sim.py
+"""
+
+import numpy as np
+import matplotlib
+import os
+# Use Agg (non-interactive) so it works on all platforms without display issues
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(0)
+
+# ══════════════════════════════════════════════
+#  SYSTEM PARAMETERS
+# ══════════════════════════════════════════════
+N       = 64        # subcarriers
+N_CP    = 16        # cyclic prefix length
+N_PIL   = 8         # pilots per OFDM symbol
+L       = 6         # channel taps (multipath)
+N_L     = 8         # DFT truncation length
+N_TR    = 2000      # training samples for CNN
+EPOCHS  = 400       # CNN training epochs
+N_TRIAL = 500       # Monte Carlo trials per SNR point
+SNR_DB  = np.array([0, 5, 10, 15, 20, 25, 30])
+
+PIL_IDX = np.arange(0, N, N // N_PIL)   # evenly spaced pilot positions
+DATA_IDX = np.array([i for i in range(N) if i not in PIL_IDX])
+
+# ══════════════════════════════════════════════
+#  CHANNEL GENERATION
+#  Exponential power delay profile (standard)
+# ══════════════════════════════════════════════
+def gen_channel(n_samples=1, fast=True, v_kmh=200):
+    """Generate frequency-domain channel matrix. Shape: (n_samples, N)"""
+    channels = np.zeros((n_samples, N), dtype=complex)
+    for s in range(n_samples):
+        # Tap powers: exponential decay
+        power = np.exp(-np.arange(L) * 0.5)
+        power /= power.sum()
+        # Complex Gaussian taps
+        h = (np.random.randn(L) + 1j * np.random.randn(L)) * np.sqrt(power / 2)
+        if fast:
+            # Add Doppler phase rotation per tap
+            c = 3e8
+            fd = (v_kmh / 3.6) * 3.5e9 / c
+            fd_norm = fd / (N * 15e3)
+            h *= np.exp(1j * 2 * np.pi * fd_norm * np.arange(L) * np.random.uniform(0, 1))
+        h_padded = np.zeros(N, dtype=complex)
+        h_padded[:L] = h
+        channels[s] = np.fft.fft(h_padded)
+    return channels
+
+# ══════════════════════════════════════════════
+#  MODULATION: QPSK
+# ══════════════════════════════════════════════
+QPSK_MAP = np.array([1+1j, -1+1j, -1-1j, 1-1j]) / np.sqrt(2)
+
+def qpsk_mod(bits):
+    bits = bits.reshape(-1, 2)
+    idx = bits[:, 0] * 2 + bits[:, 1]
+    return QPSK_MAP[idx]
+
+def qpsk_demod(syms):
+    # Hard decision: find nearest constellation point
+    dists = np.abs(syms[:, None] - QPSK_MAP[None, :])
+    idx = np.argmin(dists, axis=1)
+    bits = np.zeros((len(syms), 2), dtype=int)
+    bits[:, 0] = idx >> 1
+    bits[:, 1] = idx & 1
+    return bits.flatten()
+
+# ══════════════════════════════════════════════
+#  CHANNEL ESTIMATION METHODS
+# ══════════════════════════════════════════════
+def ls_estimate(Y_pil, X_pil):
+    """LS: divide received pilots by known pilots."""
+    H_pil = Y_pil / X_pil
+    # Linear interpolation to all subcarriers
+    H_full_r = np.interp(np.arange(N), PIL_IDX, H_pil.real)
+    H_full_i = np.interp(np.arange(N), PIL_IDX, H_pil.imag)
+    return H_full_r + 1j * H_full_i, H_pil
+
+def ls_dft_estimate(H_pil_ls):
+    """LS-DFT: LS + DFT-based noise suppression via truncation."""
+    H_full_r = np.interp(np.arange(N), PIL_IDX, H_pil_ls.real)
+    H_full_i = np.interp(np.arange(N), PIL_IDX, H_pil_ls.imag)
+    H_full = H_full_r + 1j * H_full_i
+    h_time = np.fft.ifft(H_full)
+    h_time[N_L:] = 0          # zero out taps beyond channel length
+    return np.fft.fft(h_time)
+
+def build_channel_covariance():
+    """Build R_HH at pilot positions (exponential PDP)."""
+    power = np.exp(-np.arange(L) * 0.5)
+    power /= power.sum()
+    R = np.zeros((N_PIL, N_PIL), dtype=complex)
+    for i in range(N_PIL):
+        for j in range(N_PIL):
+            diff = PIL_IDX[i] - PIL_IDX[j]
+            for l in range(L):
+                R[i, j] += power[l] * np.exp(-1j * 2 * np.pi * l * diff / N)
+    return R
+
+R_HH = build_channel_covariance()
+
+def lmmse_estimate(H_pil_ls, snr_lin):
+    """LMMSE: optimal linear estimator using channel statistics."""
+    noise_var = 1.0 / snr_lin
+    A = R_HH @ np.linalg.solve(R_HH + noise_var * np.eye(N_PIL), np.eye(N_PIL))
+    H_pil_lmmse = A @ H_pil_ls
+    H_full_r = np.interp(np.arange(N), PIL_IDX, H_pil_lmmse.real)
+    H_full_i = np.interp(np.arange(N), PIL_IDX, H_pil_lmmse.imag)
+    return H_full_r + 1j * H_full_i
+
+# ══════════════════════════════════════════════
+#  CNN (3-layer MLP, numpy only)
+# ══════════════════════════════════════════════
+class MLP:
+    def __init__(self, d_in, d_h, d_out):
+        s1 = np.sqrt(2 / d_in);  s2 = np.sqrt(2 / d_h)
+        self.W1 = np.random.randn(d_in, d_h) * s1;  self.b1 = np.zeros(d_h)
+        self.W2 = np.random.randn(d_h,  d_h) * s2;  self.b2 = np.zeros(d_h)
+        self.W3 = np.random.randn(d_h, d_out) * s2;  self.b3 = np.zeros(d_out)
+        params = [self.W1,self.b1,self.W2,self.b2,self.W3,self.b3]
+        self.m = [np.zeros_like(p) for p in params]
+        self.v = [np.zeros_like(p) for p in params]
+        self.t = 0
+
+    def relu(self, x):  return np.maximum(0, x)
+    def drelu(self, x): return (x > 0).astype(np.float32)
+
+    def forward(self, X):
+        self.X  = X
+        self.z1 = X  @ self.W1 + self.b1;  self.a1 = self.relu(self.z1)
+        self.z2 = self.a1 @ self.W2 + self.b2;  self.a2 = self.relu(self.z2)
+        self.z3 = self.a2 @ self.W3 + self.b3
+        return self.z3
+
+    def loss_and_grad(self, X, y):
+        out = self.forward(X)
+        diff = out - y
+        loss = np.mean(diff**2)
+        B = len(X)
+        d3 = 2 * diff / B
+        dW3 = self.a2.T @ d3;          db3 = d3.sum(0)
+        d2  = (d3 @ self.W3.T) * self.drelu(self.z2)
+        dW2 = self.a1.T @ d2;          db2 = d2.sum(0)
+        d1  = (d2 @ self.W2.T) * self.drelu(self.z1)
+        dW1 = self.X.T @ d1;           db1 = d1.sum(0)
+        return loss, [dW1, db1, dW2, db2, dW3, db3]
+
+    def adam_step(self, grads, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+        self.t += 1
+        params = [self.W1,self.b1,self.W2,self.b2,self.W3,self.b3]
+        for i, (p, g) in enumerate(zip(params, grads)):
+            self.m[i] = b1*self.m[i] + (1-b1)*g
+            self.v[i] = b2*self.v[i] + (1-b2)*g**2
+            m_h = self.m[i]/(1-b1**self.t)
+            v_h = self.v[i]/(1-b2**self.t)
+            p -= lr * m_h / (np.sqrt(v_h)+eps)
+
+    def predict(self, X): return self.forward(X)
+
+
+def make_dataset(n_samples, snr_db=15, v_kmh=200):
+    """Generate (noisy_ls_input, true_channel_output) pairs for training."""
+    channels = gen_channel(n_samples, v_kmh=v_kmh)
+    snr_lin  = 10**(snr_db/10)
+    nv       = 1.0 / snr_lin
+
+    X_list, y_list = [], []
+    pilot_symbols  = np.ones(N_PIL, dtype=complex)  # known pilots = 1+0j
+
+    for H in channels:
+        noise = np.sqrt(nv/2) * (np.random.randn(N_PIL) + 1j*np.random.randn(N_PIL))
+        Y_pil = H[PIL_IDX] * pilot_symbols + noise
+        H_ls, _ = ls_estimate(Y_pil, pilot_symbols)
+        # Input: truncated time-domain (real + imag concatenated)
+        h_t = np.fft.ifft(H_ls)[:N_L]
+        inp = np.concatenate([h_t.real, h_t.imag]).astype(np.float32)
+        # Target: truncated true channel time-domain
+        h_true_t = np.fft.ifft(H)[:N_L]
+        tgt = np.concatenate([h_true_t.real, h_true_t.imag]).astype(np.float32)
+        X_list.append(inp); y_list.append(tgt)
+
+    return np.array(X_list), np.array(y_list)
+
+
+def train_cnn(n_epochs=EPOCHS):
+    print("  Generating training data...")
+    X, y = make_dataset(N_TR, snr_db=15)
+    Xm, Xs = X.mean(), X.std()+1e-8
+    ym, ys = y.mean(), y.std()+1e-8
+    X = (X - Xm) / Xs;  y = (y - ym) / ys
+
+    split = int(0.85 * len(X))
+    Xtr, Xvl = X[:split], X[split:]
+    ytr, yvl = y[:split], y[split:]
+
+    model = MLP(2*N_L, 128, 2*N_L)
+    tr_loss, vl_loss = [], []
+    BS = 128
+
+    print(f"  Training {n_epochs} epochs...")
+    for ep in range(n_epochs):
+        # Cosine annealing LR
+        lr = 5e-4 + 0.5*(2e-3 - 5e-4)*(1 + np.cos(np.pi * ep / n_epochs))
+        idx = np.random.permutation(len(Xtr))
+        ep_losses = []
+        for i in range(0, len(Xtr), BS):
+            xb = Xtr[idx[i:i+BS]];  yb = ytr[idx[i:i+BS]]
+            loss, grads = model.loss_and_grad(xb, yb)
+            model.adam_step(grads, lr=lr)
+            ep_losses.append(loss)
+        vl_pred = model.predict(Xvl)
+        vl_l    = np.mean((vl_pred - yvl)**2)
+        tr_loss.append(np.mean(ep_losses))
+        vl_loss.append(vl_l)
+        if (ep+1) % 100 == 0:
+            print(f"    Epoch {ep+1}/{n_epochs}  train={tr_loss[-1]:.5f}  val={vl_l:.5f}  lr={lr:.5f}")
+
+    return model, tr_loss, vl_loss, (Xm, Xs, ym, ys)
+
+
+def cnn_estimate(H_ls_full, model, stats):
+    Xm, Xs, ym, ys = stats
+    h_t = np.fft.ifft(H_ls_full)[:N_L]
+    inp = np.concatenate([h_t.real, h_t.imag]).astype(np.float32)
+    inp = (inp - Xm) / Xs
+    out = model.predict(inp.reshape(1, -1))[0] * ys + ym
+    h_rec = out[:N_L] + 1j*out[N_L:]
+    h_pad = np.zeros(N, dtype=complex); h_pad[:N_L] = h_rec
+    return np.fft.fft(h_pad)
+
+
+# ══════════════════════════════════════════════
+#  SIMULATION ENGINE
+# ══════════════════════════════════════════════
+def run_simulation(snr_list, model, stats,
+                   remove_cp=False, clipping=False,
+                   mismatch=False, n_trials=N_TRIAL):
+    """
+    For each SNR:
+      - generate channel
+      - transmit QPSK OFDM signal
+      - add noise
+      - estimate channel with each method
+      - compute NMSE and BER
+    """
+    pilot_syms = np.ones(N_PIL, dtype=complex)
+    v = 50 if mismatch else 200
+    results = {m: {'nmse':[], 'ber':[]} for m in ['LS','LS-DFT','LMMSE','CNN']}
+
+    for snr_db in snr_list:
+        snr_lin = 10**(snr_db/10)
+        nv      = 1.0 / snr_lin
+
+        nm = {m:[] for m in results}; be = {m:[] for m in results}
+
+        for _ in range(n_trials):
+            # True channel
+            H = gen_channel(1, v_kmh=v)[0]
+
+            # Transmit data
+            n_bits  = len(DATA_IDX) * 2
+            tx_bits = np.random.randint(0, 2, n_bits)
+            tx_syms = qpsk_mod(tx_bits)
+
+            # Build full OFDM frequency symbol
+            X_freq = np.zeros(N, dtype=complex)
+            X_freq[PIL_IDX]  = pilot_syms
+            X_freq[DATA_IDX] = tx_syms
+
+            # IFFT → time domain
+            x_time = np.fft.ifft(X_freq) * np.sqrt(N)
+
+            # Clipping
+            if clipping:
+                rms = np.sqrt(np.mean(np.abs(x_time)**2))
+                thr = 0.8 * rms
+                mag = np.abs(x_time)
+                x_time = np.where(mag > thr, thr * np.exp(1j*np.angle(x_time)), x_time)
+
+            # Add CP
+            x_cp = np.concatenate([x_time[-N_CP:], x_time])
+
+            # Channel (freq domain: multiply H × X) + noise
+            # For CP removal test: skip the CP guard properly
+            if remove_cp:
+                # No CP — just take N samples, FFT, apply channel
+                noise = np.sqrt(nv/2) * (np.random.randn(N) + 1j*np.random.randn(N))
+                Y_freq = H * X_freq + noise   # ICI simplified
+            else:
+                x_rx = x_cp[N_CP:]   # remove CP
+                noise = np.sqrt(nv/2) * (np.random.randn(N) + 1j*np.random.randn(N))
+                Y_freq = H * np.fft.fft(x_rx) / np.sqrt(N) + noise
+
+            # Pilot observations
+            Y_pil = Y_freq[PIL_IDX]
+            H_ls_full, H_pil_ls = ls_estimate(Y_pil, pilot_syms)
+            H_lsdft  = ls_dft_estimate(H_pil_ls)
+            H_lmmse  = lmmse_estimate(H_pil_ls, snr_lin)
+            H_cnn    = cnn_estimate(H_ls_full, model, stats)
+
+            # NMSE
+            def nmse(Hh): return np.mean(np.abs(Hh-H)**2) / np.mean(np.abs(H)**2)
+            nm['LS'].append(nmse(H_ls_full))
+            nm['LS-DFT'].append(nmse(H_lsdft))
+            nm['LMMSE'].append(nmse(H_lmmse))
+            nm['CNN'].append(nmse(H_cnn))
+
+            # BER: equalize → demodulate → compare bits
+            def get_ber(Hh):
+                Hs = np.where(np.abs(Hh[DATA_IDX]) < 1e-9, 1e-9, Hh[DATA_IDX])
+                eq = Y_freq[DATA_IDX] / Hs
+                rb = qpsk_demod(eq)
+                return np.mean(rb != tx_bits)
+
+            be['LS'].append(get_ber(H_ls_full))
+            be['LS-DFT'].append(get_ber(H_lsdft))
+            be['LMMSE'].append(get_ber(H_lmmse))
+            be['CNN'].append(get_ber(H_cnn))
+
+        for m in results:
+            results[m]['nmse'].append(np.mean(nm[m]))
+            # BER: clamp to avoid log(0) on plots
+            results[m]['ber'].append(max(np.mean(be[m]), 1e-5))
+
+        print(f"    SNR={snr_db:2d}dB | "
+              f"NMSE LS={results['LS']['nmse'][-1]:.3f} "
+              f"LSDFT={results['LS-DFT']['nmse'][-1]:.3f} "
+              f"LMMSE={results['LMMSE']['nmse'][-1]:.3f} "
+              f"CNN={results['CNN']['nmse'][-1]:.3f} | "
+              f"BER CNN={results['CNN']['ber'][-1]:.4f}")
+
+    return results
+
+
+# ══════════════════════════════════════════════
+#  PLOTTING STYLE
+# ══════════════════════════════════════════════
+plt.rcParams.update({
+    'font.family':      'DejaVu Sans',
+    'font.size':        11,
+    'axes.titlesize':   12,
+    'axes.labelsize':   11,
+    'legend.fontsize':  9.5,
+    'xtick.labelsize':  10,
+    'ytick.labelsize':  10,
+    'axes.grid':        True,
+    'grid.alpha':       0.35,
+    'grid.linestyle':   '--',
+    'figure.dpi':       150,
+    'lines.linewidth':  2.0,
+    'lines.markersize': 7,
+})
+
+STYLE = {
+    'LS':     dict(color='#e74c3c', marker='*',  linestyle='--', markersize=9),
+    'LS-DFT': dict(color='#f39c12', marker='D',  linestyle='--', markersize=7),
+    'LMMSE':  dict(color='#27ae60', marker='o',  linestyle='-.',  markersize=7),
+    'CNN':    dict(color='#2980b9', marker='s',  linestyle='-',   markersize=7),
+}
+METHOD_LABEL = {
+    'LS': 'LS', 'LS-DFT': 'LS-DFT', 'LMMSE': 'LMMSE', 'CNN': 'CNN (Proposed)'
+}
+
+
+def make_fig(results, snr, title_a, title_b, suptitle, fname):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig.suptitle(suptitle, fontsize=13, fontweight='bold', y=1.01)
+
+    for m in ['LS', 'LS-DFT', 'LMMSE', 'CNN']:
+        kw = STYLE[m]
+        axes[0].semilogy(snr, results[m]['nmse'], label=METHOD_LABEL[m], **kw)
+        axes[1].semilogy(snr, results[m]['ber'],  label=METHOD_LABEL[m], **kw)
+
+    for ax, ylabel, title in [
+        (axes[0], 'NMSE',        title_a),
+        (axes[1], 'Bit Error Rate (BER)', title_b),
+    ]:
+        ax.set_xlabel('SNR (dB)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontweight='bold')
+        ax.set_xticks(snr)
+        ax.legend(loc='upper right')
+        ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
+        ax.set_xlim(snr[0]-1, snr[-1]+1)
+
+    # BER axis: show reference lines
+    axes[1].axhline(y=0.5,  color='gray', linewidth=0.8, linestyle=':', alpha=0.5)
+    axes[1].axhline(y=0.01, color='gray', linewidth=0.8, linestyle=':', alpha=0.5)
+    axes[1].set_ylim(1e-4, 1.0)
+
+    fig.tight_layout()
+    fig.savefig(fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: {fname}")
+
+
+# ══════════════════════════════════════════════
+#  RUN EVERYTHING
+# ══════════════════════════════════════════════
+print("="*58)
+print("  MIMO-OFDM Channel Estimation — Full Simulation")
+print("="*58)
+
+# 1. Train CNN
+print("\n[STEP 1] Training CNN...")
+model, tr_loss, vl_loss, stats = train_cnn(EPOCHS)
+
+# 2. Convergence plot (Fig 5)
+print("\n[STEP 2] Fig 5: Convergence...")
+fig5, ax5 = plt.subplots(figsize=(9, 5))
+ep = np.arange(1, len(tr_loss)+1)
+ax5.semilogy(ep, tr_loss, color='#c0392b', label='Training Loss',   linewidth=1.8)
+ax5.semilogy(ep, vl_loss, color='#2980b9', label='Validation Loss', linewidth=1.8, linestyle='--')
+ax5.set_xlabel('Epoch'); ax5.set_ylabel('MSE Loss')
+ax5.set_title('Fig 5: CNN Training Convergence', fontweight='bold')
+ax5.legend(); fig5.tight_layout()
+fig5.savefig('fig5_convergence.png', dpi=150, bbox_inches='tight')
+plt.close(fig5); print("  Saved: fig5_convergence.png")
+
+# 3. Normal conditions (Fig 6)
+print("\n[STEP 3] Fig 6: Normal conditions...")
+r6 = run_simulation(SNR_DB, model, stats)
+make_fig(r6, SNR_DB,
+         '(a) NMSE — Normal Conditions',
+         '(b) BER — Normal Conditions',
+         'Fig 6: NMSE & BER Performance (Standard Conditions)',
+         'fig6_normal.png')
+
+# 4. CP removal (Fig 7)
+print("\n[STEP 4] Fig 7: CP removed...")
+r7 = run_simulation(SNR_DB, model, stats, remove_cp=True)
+make_fig(r7, SNR_DB,
+         '(a) NMSE — Without CP',
+         '(b) BER — Without CP',
+         'Fig 7: NMSE & BER Performance (Cyclic Prefix Removed)',
+         'fig7_nocp.png')
+
+# 5. Clipping noise (Fig 8)
+print("\n[STEP 5] Fig 8: Clipping noise...")
+r8 = run_simulation(SNR_DB, model, stats, clipping=True)
+make_fig(r8, SNR_DB,
+         '(a) NMSE — Clipping Noise',
+         '(b) BER — Clipping Noise',
+         'Fig 8: NMSE & BER Performance (With Clipping Noise)',
+         'fig8_clipping.png')
+
+# 6. Channel mismatch (Fig 9)
+print("\n[STEP 6] Fig 9: Channel mismatch...")
+r9 = run_simulation(SNR_DB, model, stats, mismatch=True)
+make_fig(r9, SNR_DB,
+         '(a) NMSE — Channel Mismatch',
+         '(b) BER — Channel Mismatch',
+         'Fig 9: NMSE & BER Performance (Channel Mismatch, v=50km/h)',
+         'fig9_mismatch.png')
+
+# 7. All adversities (Fig 10)
+print("\n[STEP 7] Fig 10: All adversities...")
+r10 = run_simulation(SNR_DB, model, stats, remove_cp=True, clipping=True, mismatch=True)
+make_fig(r10, SNR_DB,
+         '(a) NMSE — All Adversities',
+         '(b) BER — All Adversities',
+         'Fig 10: NMSE & BER Performance (All Adversities Combined)',
+         'fig10_all.png')
+
+# 8. Master dashboard
+print("\n[STEP 8] Master dashboard...")
+scenarios = [
+    (r6,  'Fig 6 — Normal',         'fig6'),
+    (r7,  'Fig 7 — CP Removed',     'fig7'),
+    (r8,  'Fig 8 — Clipping',       'fig8'),
+    (r9,  'Fig 9 — Mismatch',       'fig9'),
+    (r10, 'Fig 10 — All Adversities','fig10'),
+]
+
+fig_d, axes_d = plt.subplots(5, 2, figsize=(15, 28))
+fig_d.patch.set_facecolor('#0d1117')
+
+for row, (res, label, _) in enumerate(scenarios):
+    for col, (key, ylabel) in enumerate([('nmse','NMSE'),('ber','BER')]):
+        ax = axes_d[row, col]
+        ax.set_facecolor('#161b22')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#30363d')
+        ax.tick_params(colors='#c9d1d9')
+        ax.xaxis.label.set_color('#c9d1d9')
+        ax.yaxis.label.set_color('#c9d1d9')
+        ax.title.set_color('#e6edf3')
+        ax.grid(True, which='both', color='#21262d', linestyle='--', alpha=0.7)
+
+        for m in ['LS','LS-DFT','LMMSE','CNN']:
+            kw = dict(STYLE[m])
+            ax.semilogy(SNR_DB, res[m][key], label=METHOD_LABEL[m], **kw)
+
+        ax.set_title(f'{label} — {ylabel}', fontweight='bold', fontsize=10)
+        ax.set_xlabel('SNR (dB)', fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_xticks(SNR_DB)
+        if key == 'ber':
+            ax.set_ylim(1e-4, 1.0)
+        leg = ax.legend(fontsize=8, loc='upper right',
+                        facecolor='#161b22', edgecolor='#30363d')
+        for t in leg.get_texts(): t.set_color('#c9d1d9')
+
+fig_d.suptitle('MIMO-OFDM Channel Estimation — Full Results Dashboard',
+               fontsize=16, fontweight='bold', color='#e6edf3', y=1.005)
+fig_d.tight_layout(h_pad=3.0)
+fig_d.savefig('dashboard.png',
+              dpi=150, bbox_inches='tight', facecolor='#0d1117')
+plt.close(fig_d)
+print("  Saved: dashboard.png")
+
+print("\n" + "="*58)
+print("  DONE. All files saved to outputs/")
+print("  ├─ fig5_convergence.png")
+print("  ├─ fig6_normal.png")
+print("  ├─ fig7_nocp.png")
+print("  ├─ fig8_clipping.png")
+print("  ├─ fig9_mismatch.png")
+print("  ├─ fig10_all.png")
+print("  └─ dashboard.png  ← all in one")
+print("="*58)
