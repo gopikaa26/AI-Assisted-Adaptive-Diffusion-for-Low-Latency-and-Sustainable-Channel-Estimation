@@ -1,0 +1,573 @@
+"""
+A-CDDCE Final — Matches paper scale exactly
+============================================
+System parameters match the CDDCE paper (Fu et al., DSP 2025):
+  N=128, N_frame=64, v=200km/h, D_PIL=4, N_pilot=32, N_l=36
+
+Curves shown: LS | CDDCE (fixed-T, SNR-conditioned) | A-CDDCE (Adaptive-T + DualAttn)
+
+Novelty of A-CDDCE over CDDCE:
+  1. SNR Embedding      : richer sinusoidal SNR conditioning (d=48)
+  2. Adaptive-T         : CQI-guided diffusion steps (low-quality → more steps)
+  3. Dual-Axis Attention: delay-domain + frame-domain cross-attention
+  4. MC Dropout         : uncertainty-aware multi-sample averaging
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import time, warnings
+warnings.filterwarnings('ignore')
+try:
+    from tqdm.auto import tqdm
+except:
+    def tqdm(x, **kw): return x
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {DEVICE}")
+if DEVICE.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# ================================================================
+# SYSTEM PARAMETERS — matching the paper exactly
+# ================================================================
+N_T, N_R   = 2, 2
+N          = 128        # subcarriers (paper: 128)
+N_FRAME    = 64         # OFDM symbols per frame (paper: 64)
+N_L        = 36         # truncation length (paper: 36)
+D_PIL      = 4          # pilot spacing → 32 pilots/TX (paper: N_pilot=32)
+N_TR       = N_T * N_R
+V_KMH      = 200.0      # velocity (paper: 200 km/h)
+
+# Adaptive-T range
+T_MIN, T_MAX = 4, 12
+
+# MC Dropout
+N_MC         = 8
+MC_DROPOUT_P = 0.10
+
+# Training
+NUM_SAMPLES   = 1400    # 1400/6 ≈ 233 per SNR
+BATCH_SIZE    = 16
+TOTAL_EPOCHS  = 400
+WARMUP_EPOCHS = 60
+BASE_LR       = 3e-4
+INIT_LR       = 5e-5
+
+SNR_RANGE   = [5, 10, 15, 20, 25, 30]
+TRAIN_SNRS  = [5, 10, 15, 20, 25, 30]
+N_TEST      = 50
+
+# Diffusion
+T_DIFF = 15
+
+# ================================================================
+# TDL-C CHANNEL — paper: 3.5 GHz, 8-tap profile
+# ================================================================
+DELAYS_NORM = np.array([0,0.2099,0.2219,0.2329,0.6366,0.6448,0.7935,0.9336])
+POWERS_DB   = np.array([-4.4,-1.2,-3.5,-5.2,0.0,-2.2,-7.1,-11.1])
+DELAYS_F    = DELAYS_NORM * 634e-9
+POWERS      = 10**(POWERS_DB/10); POWERS /= POWERS.sum()
+
+def generate_tdlc_channel():
+    delta_f = 30e3; T_sym = 1/delta_f; Ts = 1/(N*delta_f)
+    f_d = (V_KMH/3.6)*3.5e9/3e8
+    N_m = len(DELAYS_F)
+    H = np.zeros((N_T,N_R,N,N_FRAME), dtype=np.complex64)
+    for tx in range(N_T):
+        for rx in range(N_R):
+            theta = 2*np.pi*np.random.rand(N_m)
+            for ti in range(N_FRAME):
+                h = np.zeros(N, dtype=np.complex64)
+                for m in range(N_m):
+                    ph = np.exp(1j*2*np.pi*f_d*(ti+1)*T_sym*np.cos(theta[m]))
+                    c  = np.sqrt(POWERS[m]/2)*(np.random.randn()+1j*np.random.randn())*ph
+                    idx = int(round(DELAYS_F[m]/Ts))
+                    if idx < N: h[idx] += c.astype(np.complex64)
+                H[tx,rx,:,ti] = np.fft.fft(h).astype(np.complex64)
+    return H
+
+# ================================================================
+# OFDM TX/RX — paper: QPSK, pilot spacing D=4
+# ================================================================
+def mimo_ofdm_txrx(H_true, snr_db):
+    pil, xpil = [], []
+    for tx in range(N_T):
+        idx = np.arange(tx, N, D_PIL); pil.append(idx)
+        s = ((2*np.random.randint(0,2,len(idx))-1) +
+             1j*(2*np.random.randint(0,2,len(idx))-1))/np.sqrt(2)
+        xpil.append(s.astype(np.complex64))
+
+    X = np.zeros((N_T,N,N_FRAME), dtype=np.complex64)
+    for t in range(N_FRAME):
+        for tx in range(N_T):
+            di = np.setdiff1d(np.arange(N), pil[tx])
+            X[tx,pil[tx],t] = xpil[tx]
+            X[tx,di,t] = ((2*np.random.randint(0,2,len(di))-1) +
+                          1j*(2*np.random.randint(0,2,len(di))-1))/np.sqrt(2)
+
+    Yc = np.zeros((N_R,N,N_FRAME), dtype=np.complex64)
+    for t in range(N_FRAME):
+        for rx in range(N_R):
+            for tx in range(N_T):
+                Yc[rx,:,t] += H_true[tx,rx,:,t]*X[tx,:,t]
+
+    sp    = np.mean(np.abs(Yc)**2)
+    noise = np.sqrt(sp/(10**(snr_db/10))/2)*(
+        np.random.randn(N_R,N,N_FRAME)+1j*np.random.randn(N_R,N,N_FRAME)
+    ).astype(np.complex64)
+    Y = Yc + noise
+
+    ak   = np.arange(N, dtype=float)
+    H_LS = np.zeros((N_T,N_R,N,N_FRAME), dtype=np.complex64)
+    for t in range(N_FRAME):
+        for tx in range(N_T):
+            fi = pil[tx].astype(float)
+            for rx in range(N_R):
+                Hp = Y[rx,pil[tx],t]/xpil[tx]
+                H_LS[tx,rx,:,t] = (np.interp(ak,fi,Hp.real) +
+                                   1j*np.interp(ak,fi,Hp.imag)).astype(np.complex64)
+    return Y, pil, xpil, H_LS, X
+
+# ================================================================
+# PREPROCESSING — paper eq.(14)-(15): IFFT + truncate to N_L taps
+# ================================================================
+def preprocess(H):
+    ht = np.fft.ifft(H, axis=2)[:,:,:N_L,:]        # [NT,NR,N_L,NF]
+    hr = ht.reshape(N_TR, N_L, N_FRAME)
+    return np.concatenate([hr.real, hr.imag], axis=1).astype(np.float32)  # [N_TR,2*N_L,NF]
+
+def inv_preprocess(h):
+    hc = (h[:,:N_L,:] + 1j*h[:,N_L:,:]).astype(np.complex64)
+    hc = hc.reshape(N_T,N_R,N_L,N_FRAME)
+    hp = np.zeros((N_T,N_R,N,N_FRAME), dtype=np.complex64)
+    hp[:,:,:N_L,:] = hc
+    return np.fft.fft(hp, axis=2).astype(np.complex64)
+
+# ================================================================
+# CQI — energy concentration in dominant taps
+# High CQI → sparse channel → fewer diffusion steps
+# ================================================================
+def extract_cqi(h):
+    hc  = h[:,:N_L,:] + 1j*h[:,N_L:,:]
+    pwr = np.abs(hc)**2
+    k   = max(1, N_L//6)
+    sp  = np.sort(pwr.reshape(-1))[::-1]
+    return float(np.clip(sp[:k].sum()/(sp.sum()+1e-12)*2, 0, 1))
+
+def adaptive_t(cqi):
+    return int(np.clip(T_MAX - round((T_MAX-T_MIN)*cqi), T_MIN, T_MAX))
+
+# ================================================================
+# COSINE DIFFUSION SCHEDULE
+# ================================================================
+def make_schedule(T=15, s=0.008):
+    tr  = np.arange(T+1)/T
+    ac  = np.cos((tr+s)/(1+s)*np.pi/2)**2; ac /= ac[0]
+    acp = ac[1:].astype(np.float32)
+    b   = np.clip(1-acp/ac[:-1], 1e-5, 0.999).astype(np.float32)
+    return dict(T=T, betas=b, alphas=(1-b).astype(np.float32),
+                acp=acp, sacp=np.sqrt(acp), s1macp=np.sqrt(1-acp))
+
+SCH = make_schedule(T_DIFF)
+print(f"Diffusion schedule: T={T_DIFF}, "
+      f"beta=[{SCH['betas'].min():.4f}, {SCH['betas'].max():.4f}]")
+
+def fwd_diff(h0, ts, sch):
+    a = torch.tensor(sch['sacp'],   device=h0.device)[ts-1].view(-1,1,1,1)
+    s = torch.tensor(sch['s1macp'], device=h0.device)[ts-1].view(-1,1,1,1)
+    e = torch.randn_like(h0)
+    return a*h0 + s*e, e
+
+# ================================================================
+# MODEL
+# ================================================================
+
+class SNREmb(nn.Module):
+    """Sinusoidal SNR embedding — conditions every ResBlock on channel SNR"""
+    def __init__(self, d=48):
+        super().__init__()
+        self.d   = d
+        self.mlp = nn.Sequential(
+            nn.Linear(d, d*4), nn.SiLU(),
+            nn.Linear(d*4, d*2), nn.SiLU(),
+            nn.Linear(d*2, d))
+    def forward(self, snr):
+        h = self.d // 2
+        f = torch.exp(-np.log(10000)*torch.arange(h, device=snr.device)/h)
+        a = snr.unsqueeze(1) * f.unsqueeze(0)
+        return self.mlp(torch.cat([torch.sin(a), torch.cos(a)], 1))
+
+
+class CRB(nn.Module):
+    """Conditioned Residual Block with FiLM modulation from SNR embedding"""
+    def __init__(self, ic, oc, ed=48, dp=0.0):
+        super().__init__()
+        self.c1 = nn.Conv2d(ic, oc, 3, padding=1)
+        self.g1 = nn.GroupNorm(min(4,oc), oc)
+        self.c2 = nn.Conv2d(oc, oc, 3, padding=1)
+        self.g2 = nn.GroupNorm(min(4,oc), oc)
+        self.pr = nn.Conv2d(ic, oc, 1) if ic != oc else nn.Identity()
+        self.ag = nn.Linear(ed, oc*2)
+        self.dr = nn.Dropout2d(dp)
+    def forward(self, x, e):
+        r      = F.silu(self.g1(self.c1(x)))
+        sc, sh = self.ag(e).chunk(2, 1)
+        r      = r*(1+sc.unsqueeze(-1).unsqueeze(-1)) + sh.unsqueeze(-1).unsqueeze(-1)
+        return self.dr(F.silu(self.g2(self.c2(r)))) + self.pr(x)
+
+
+class DualAxisAttention(nn.Module):
+    """
+    NOVELTY: Attention across both delay axis (H) and frame axis (W).
+    - Delay axis captures multipath/frequency-selective structure
+    - Frame axis captures Doppler/temporal-selective structure
+    Learnable gate controls contribution of each.
+    """
+    def __init__(self, ch, heads=4):
+        super().__init__()
+        self.gn   = nn.GroupNorm(min(4,ch), ch)
+        self.af   = nn.MultiheadAttention(ch, heads, batch_first=True, dropout=0.05)
+        self.at   = nn.MultiheadAttention(ch, heads, batch_first=True, dropout=0.05)
+        self.mix  = nn.Conv2d(ch*2, ch, 1)
+        self.gate = nn.Parameter(torch.zeros(1))
+    def forward(self, x):
+        B, C, H, W = x.shape
+        r  = self.gn(x)
+        # Delay-domain attention
+        rf     = r.permute(0,3,2,1).reshape(B*W, H, C)
+        af, _  = self.af(rf, rf, rf)
+        af     = af.reshape(B, W, H, C).permute(0,3,2,1)
+        # Frame-domain attention
+        rt     = r.permute(0,2,3,1).reshape(B*H, W, C)
+        at, _  = self.at(rt, rt, rt)
+        at     = at.reshape(B, H, W, C).permute(0,3,1,2)
+        return x + torch.tanh(self.gate) * self.mix(torch.cat([af, at], 1))
+
+
+class UNet(nn.Module):
+    """
+    U-Net for A-CDDCE.
+    Input: [noisy_h_t | h_LS_preprocessed] → 8 channels
+    Output: predicted noise epsilon → 4 channels (N_TR real+imag concatenated)
+
+    Architecture differences from baseline CDDCE:
+    - Wider: 24→48→96 vs paper's 16→32→64
+    - SNR embedding d=48 (larger, richer)
+    - 2× DualAxisAttention at bottleneck vs 1× standard attention
+    """
+    def __init__(self, ed=48, dp=0.0):
+        super().__init__()
+        self.se  = SNREmb(ed)
+        self.fi  = nn.Sequential(nn.Conv2d(8, 24, 3, padding=1),
+                                  nn.GroupNorm(4,24), nn.SiLU())
+        self.e1  = CRB(24, 24, ed, dp)
+        self.d1  = nn.Conv2d(24, 24, 3, stride=2, padding=1)
+        self.e2  = CRB(24, 48, ed, dp)
+        self.d2  = nn.Conv2d(48, 48, 3, stride=2, padding=1)
+        self.b1  = CRB(48, 96, ed, dp)
+        self.ca1 = DualAxisAttention(96, heads=4)
+        self.b2  = CRB(96, 96, ed, dp)
+        self.ca2 = DualAxisAttention(96, heads=4)
+        self.b3  = CRB(96, 96, ed, dp)
+        self.u2  = nn.ConvTranspose2d(96, 48, 2, stride=2)
+        self.dc2 = CRB(96, 48, ed, dp)
+        self.u1  = nn.ConvTranspose2d(48, 24, 2, stride=2)
+        self.dc1 = CRB(48, 24, ed, dp)
+        self.out = nn.Sequential(nn.GroupNorm(4,24), nn.SiLU(), nn.Conv2d(24, 4, 1))
+
+    @staticmethod
+    def _p(x, r):
+        dh = r.shape[2]-x.shape[2]; dw = r.shape[3]-x.shape[3]
+        return F.pad(x,[0,max(0,dw),0,max(0,dh)]) if dh>0 or dw>0 else x
+
+    def forward(self, x, snr):
+        e  = self.se(snr)
+        x0 = self.fi(x)
+        e1 = self.e1(x0, e);  d1 = self.d1(e1)
+        e2 = self.e2(d1, e);  d2 = self.d2(e2)
+        b  = self.b1(d2, e)
+        b  = self.ca1(b)
+        b  = self.b2(b, e)
+        b  = self.ca2(b)
+        b  = self.b3(b, e)
+        u2 = self.dc2(torch.cat([self._p(self.u2(b),e2), e2], 1), e)
+        u1 = self.dc1(torch.cat([self._p(self.u1(u2),e1), e1], 1), e)
+        return self.out(u1)
+
+    def mc_on(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d)): m.train()
+
+# ================================================================
+# DATASET & DATA GENERATION
+# ================================================================
+class CDS(Dataset):
+    def __init__(self, ht, hp, sl):
+        self.ht = torch.tensor(ht, dtype=torch.float32)
+        self.hp = torch.tensor(hp, dtype=torch.float32)
+        self.sl = torch.tensor(sl, dtype=torch.float32)
+    def __len__(self): return len(self.ht)
+    def __getitem__(self, i): return self.ht[i], self.hp[i], self.sl[i]
+
+def gen_data(n=NUM_SAMPLES):
+    per_snr = n // len(TRAIN_SNRS)
+    print(f"Generating {n} samples ({per_snr}/SNR) across SNR={TRAIN_SNRS}...")
+    ht_all, hp_all, sl_all = [], [], []
+    np.random.seed(42)
+    for s in TRAIN_SNRS:
+        ht = np.zeros((per_snr, N_TR, 2*N_L, N_FRAME), dtype=np.float32)
+        hp = np.zeros((per_snr, N_TR, 2*N_L, N_FRAME), dtype=np.float32)
+        for i in tqdm(range(per_snr), desc=f"SNR={s}dB"):
+            H = generate_tdlc_channel()
+            _,_,_,HL,_ = mimo_ofdm_txrx(H, s)
+            ht[i] = preprocess(H)
+            hp[i] = preprocess(HL)
+        ht_all.append(ht); hp_all.append(hp)
+        sl_all.append(np.full(per_snr, s, dtype=np.float32))
+    return (np.concatenate(ht_all),
+            np.concatenate(hp_all),
+            np.concatenate(sl_all))
+
+# ================================================================
+# TRAINING
+# ================================================================
+def train_model(ht, hp, sl):
+    dl = DataLoader(CDS(ht,hp,sl), batch_size=BATCH_SIZE, shuffle=True,
+                    num_workers=2, pin_memory=True)
+    model = UNet(ed=48, dp=MC_DROPOUT_P).to(DEVICE)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.3f}M")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=INIT_LR,
+                             betas=(0.9,0.999), weight_decay=1e-4)
+    sg  = {k:(torch.tensor(v,device=DEVICE) if isinstance(v,np.ndarray) else v)
+           for k,v in SCH.items()}
+
+    def lr_fn(ep):
+        if ep < WARMUP_EPOCHS:
+            return INIT_LR + (BASE_LR-INIT_LR)*(ep/WARMUP_EPOCHS)
+        return BASE_LR*0.5*(1+np.cos(
+            np.pi*(ep-WARMUP_EPOCHS)/(TOTAL_EPOCHS-WARMUP_EPOCHS)))
+
+    hist=[]; best=float('inf'); t0=time.time()
+    print(f"\n{'Ep':>5}|{'Loss':>10}|{'LR':>9}|{'ETA':>7}")
+    print("-"*38)
+    for ep in range(1, TOTAL_EPOCHS+1):
+        lr = lr_fn(ep)
+        for g in opt.param_groups: g['lr'] = lr
+        model.train(); el=0; nb=0
+        for hb,hpb,sb in dl:
+            hb  = hb.to(DEVICE, non_blocking=True)
+            hpb = hpb.to(DEVICE, non_blocking=True)
+            sb  = sb.to(DEVICE, non_blocking=True)
+            ts  = torch.randint(1, T_DIFF+1, (hb.shape[0],), device=DEVICE)
+            ht_, eps = fwd_diff(hb, ts, sg)
+            loss = F.mse_loss(model(torch.cat([ht_,hpb],1), sb), eps)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            el += loss.item(); nb += 1
+        avg = el/nb; hist.append(avg)
+        if avg < best:
+            best = avg
+            torch.save(model.state_dict(), 'best_final.pt')
+        if ep%30==0 or ep==1:
+            ela = time.time()-t0; eta = ela*(TOTAL_EPOCHS-ep)/ep
+            print(f"{ep:>5}|{avg:>10.6f}|{lr:>9.2e}|{eta/60:>5.1f}m")
+    print(f"Best loss: {best:.6f}")
+    return model, hist
+
+# ================================================================
+# INFERENCE
+# ================================================================
+def rev_diff(model, hpt, snrt, t0_step):
+    sa = SCH['sacp']; s1 = SCH['s1macp']
+    ht = sa[t0_step-1]*hpt + s1[t0_step-1]*torch.randn_like(hpt)
+    with torch.no_grad():
+        for t in range(t0_step, 0, -1):
+            ep_ = model(torch.cat([ht,hpt],1), snrt)
+            at  = SCH['alphas'][t-1]; ab = SCH['acp'][t-1]
+            ht  = (1/np.sqrt(at))*(ht-((1-at)/np.sqrt(max(1-ab,1e-10)))*ep_)
+            if t > 1:
+                ht += np.sqrt(SCH['betas'][t-1])*torch.randn_like(ht)*0.3
+    return ht
+
+
+def infer_cddce(model, hp_np, snr):
+    """
+    Baseline CDDCE: fixed T=T_DIFF//2, actual SNR conditioning, single pass.
+    """
+    hpt  = torch.tensor(hp_np[None], dtype=torch.float32, device=DEVICE)
+    snrt = torch.tensor([float(snr)], dtype=torch.float32, device=DEVICE)
+    model.eval()
+    return rev_diff(model, hpt, snrt, T_DIFF//2)[0].cpu().numpy()
+
+
+def infer_acddce(model, hp_np, snr):
+    """
+    A-CDDCE (our method):
+    1. Adaptive-T: CQI determines number of denoising steps
+    2. MC Dropout: N_MC stochastic passes → mean for cleaner estimate
+    3. SNR conditioning: actual SNR passed to network
+    """
+    cqi  = extract_cqi(hp_np)
+    ts   = adaptive_t(cqi)
+    hpt  = torch.tensor(hp_np[None], dtype=torch.float32, device=DEVICE)
+    snrt = torch.tensor([float(snr)], dtype=torch.float32, device=DEVICE)
+    model.eval(); model.mc_on()
+    samps = [rev_diff(model, hpt, snrt, ts) for _ in range(N_MC)]
+    return torch.stack(samps).mean(0)[0].cpu().numpy()
+
+# ================================================================
+# METRICS
+# ================================================================
+def nmse(Ht, He):
+    return np.mean(np.abs(Ht-He)**2) / np.mean(np.abs(Ht)**2)
+
+def ber(Y, He, X):
+    e=0; t=0
+    for f in range(N_FRAME):
+        for k in range(N):
+            xk = np.linalg.lstsq(He[:,:,k,f].T, Y[:,k,f].reshape(-1,1),
+                                  rcond=None)[0].flatten()
+            xt = X[:,k,f]
+            e += np.sum((np.real(xk)>0)!=(np.real(xt)>0))
+            e += np.sum((np.imag(xk)>0)!=(np.imag(xt)>0))
+            t += 2*N_T
+    return e/t
+
+# ================================================================
+# EVALUATION
+# ================================================================
+def evaluate(model):
+    print("\n"+"="*55+"\nEVALUATION\n"+"="*55)
+    res = {m:{'nmse':[],'ber':[]} for m in ['LS','CDDCE','ACDDCE']}
+    for snr in SNR_RANGE:
+        acc = {m:{'n':[],'b':[]} for m in res}
+        print(f"\nSNR={snr}dB ...")
+        np.random.seed(300+snr)
+        for _ in tqdm(range(N_TEST), leave=False):
+            H = generate_tdlc_channel()
+            Y,_,_,HL,X = mimo_ofdm_txrx(H, snr)
+            hp = preprocess(HL)
+            HC = inv_preprocess(infer_cddce(model,  hp, snr))
+            HA = inv_preprocess(infer_acddce(model, hp, snr))
+            for tag,He in [('LS',HL),('CDDCE',HC),('ACDDCE',HA)]:
+                acc[tag]['n'].append(nmse(H, He))
+                acc[tag]['b'].append(ber(Y, He, X))
+        for m in res:
+            mn=np.mean(acc[m]['n']); mb=np.mean(acc[m]['b'])
+            res[m]['nmse'].append(mn); res[m]['ber'].append(mb)
+            print(f"  {m:8s} NMSE={mn:.3e}  BER={mb:.3e}")
+    for m in res:
+        res[m]['nmse'] = np.array(res[m]['nmse'])
+        res[m]['ber']  = np.array(res[m]['ber'])
+    return res
+
+# ================================================================
+# PLOT — matching paper style
+# ================================================================
+def plot_results(snr_range, res, hist=None):
+    plt.rcParams.update({'font.size':12, 'lines.linewidth':2.2,
+                         'lines.markersize':8, 'figure.dpi':150})
+    styles = {
+        'LS':     ('b*--', 'LS'),
+        'CDDCE':  ('mo-',  'CDDCE (fixed T)'),
+        'ACDDCE': ('rs-',  'A-CDDCE (Adaptive-T + DualAttn, Ours)'),
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(13,5))
+    fig.suptitle('A-CDDCE | 2×2 MIMO-OFDM TDL-C 200km/h | N=128',
+                 fontweight='bold')
+
+    for ax, (metric, ylabel, lab) in zip(
+            axes, [('nmse','NMSE','(a)'), ('ber','BER','(b)')]):
+        all_v = []
+        for m, (sty, lbl) in styles.items():
+            v = res[m][metric]; all_v.extend(v[v>0].tolist())
+            ax.semilogy(snr_range, v, sty, label=lbl)
+        ax.set_xlim([snr_range[0]-1, snr_range[-1]+1])
+        ax.set_xlabel('SNR (dB)', fontweight='bold')
+        ax.set_ylabel(ylabel,     fontweight='bold')
+        ax.set_title(f"{lab} {ylabel} Performance", fontweight='bold')
+        ax.set_xticks(snr_range)
+        ax.grid(True, which='both', alpha=0.3, linestyle='--')
+        ax.legend(loc='upper right')
+        ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
+
+    fig.tight_layout()
+    fig.savefig('acddce_final_results.png', dpi=150, bbox_inches='tight')
+    print("Saved: acddce_final_results.png")
+
+    if hist:
+        fig2, ax2 = plt.subplots(figsize=(8,4))
+        ax2.semilogy(np.arange(1,len(hist)+1), hist, color='#c0392b')
+        ax2.axvline(WARMUP_EPOCHS, color='gray', linestyle='--', label='Warmup end')
+        ax2.set_xlabel('Epoch',    fontweight='bold')
+        ax2.set_ylabel('MSE Loss', fontweight='bold')
+        ax2.set_title('Training Loss — A-CDDCE', fontweight='bold')
+        ax2.grid(True, which='both', alpha=0.3, linestyle='--')
+        ax2.legend(); fig2.tight_layout()
+        fig2.savefig('acddce_final_train.png', dpi=150, bbox_inches='tight')
+        print("Saved: acddce_final_train.png")
+
+    plt.show(); plt.close('all')
+
+    print("\n"+"="*65)
+    print(f"{'SNR':>4} | {'NMSE-LS':>10} | {'NMSE-CDDCE':>10} | {'NMSE-ACDDCE':>11}")
+    print("-"*50)
+    for i, s in enumerate(snr_range):
+        best = min(res[m]['nmse'][i] for m in res)
+        tag  = " ← BEST" if res['ACDDCE']['nmse'][i]==best else ""
+        print(f"{s:>4} | {res['LS']['nmse'][i]:>10.3e} | "
+              f"{res['CDDCE']['nmse'][i]:>10.3e} | "
+              f"{res['ACDDCE']['nmse'][i]:>11.3e}{tag}")
+
+    print(f"\n{'SNR':>4} | {'BER-LS':>10} | {'BER-CDDCE':>10} | {'BER-ACDDCE':>11}")
+    print("-"*50)
+    for i, s in enumerate(snr_range):
+        best = min(res[m]['ber'][i] for m in res)
+        tag  = " ← BEST" if res['ACDDCE']['ber'][i]==best else ""
+        print(f"{s:>4} | {res['LS']['ber'][i]:>10.3e} | "
+              f"{res['CDDCE']['ber'][i]:>10.3e} | "
+              f"{res['ACDDCE']['ber'][i]:>11.3e}{tag}")
+
+# ================================================================
+# MAIN
+# ================================================================
+t0 = time.time()
+print("\n"+"="*60)
+print("  A-CDDCE FINAL — Paper Parameters (N=128, N_frame=64)")
+print("  Novelties: Adaptive-T | SNR-Emb(48) | 2×DualAxisAttn | MC-8")
+print("  Curves: LS | CDDCE | A-CDDCE")
+print("="*60)
+
+ht, hp, sl = gen_data()
+model, hist = train_model(ht, hp, sl)
+model.load_state_dict(torch.load('best_final.pt', map_location=DEVICE))
+print("Best checkpoint loaded.")
+
+res = evaluate(model)
+plot_results(SNR_RANGE, res, hist)
+
+np.savez('acddce_final_results.npz',
+         snr=SNR_RANGE,
+         **{f"{m}_{k}": res[m][k] for m in res for k in ['nmse','ber']},
+         loss=np.array(hist))
+
+total = (time.time()-t0)/60
+print(f"\nTotal runtime: {total:.1f} min")
+print("Output files: acddce_final_results.png | acddce_final_train.png | best_final.pt")
+
+try:
+    from IPython.display import display, Image
+    display(Image('acddce_final_results.png'))
+    display(Image('acddce_final_train.png'))
+except:
+    pass
